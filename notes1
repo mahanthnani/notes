@@ -1,0 +1,205 @@
+AD Security Group Deletion Process
+Nov 4, 2026 · @Mahanth
+Overview
+A security group is deleted only after it has been assessed, approved, and left empty in quarantine for 30 days with no reported impact. Emptying the group first stops the access it grants but keeps its SID, so every permission can be restored instantly if something breaks.
+Scope. Domain local, global and universal security groups in on-premises Active Directory.
+Out of scope (never delete through this process):
+• Built-in and critical system groups, such as Domain Admins, Enterprise Admins, Administrators, Account Operators, Server Operators and Domain Users. These have isCriticalSystemObject = True or sit in the Builtin container.
+• Groups protected by AdminSDHolder (adminCount = 1). Investigate these separately.
+• Groups created and managed by an identity governance tool (SailPoint, MIM, Okta and similar). Delete them in that tool, or it will recreate them.
+• Distribution groups. Exchange owns those.
+Roles
+Role
+Responsibility
+Requester
+Raises the deletion request and gives the reason
+Group owner (managedBy) or app owner
+Confirms the group is no longer needed and signs off
+AD administrator
+Runs the discovery, impact checks, quarantine, deletion and rollback
+Change approver (CAB)
+Approves the change before quarantine starts
+File server, application and Entra ID admins
+Check for group use in their systems during impact assessment
+Phases
+1. Identify candidate groups (Phase 1).
+2. Assess impact: where the group is used and what depends on it (Phase 2).
+3. Approve: owner sign-off and change request (Phase 3).
+4. Back up and quarantine: export everything, remove all members, move to a quarantine OU, then wait 30 days (Phase 4).
+5. Delete and verify (Phase 5).
+Rollback is possible at every step and is described in its own section below.
+Phase 1: Identify candidate groups
+AD does not record when a group was last used for access, so discovery only produces candidates. Phase 2 and the quarantine wait are what prove a group is unused.
+Export all security groups with the details needed to triage them. Run in an elevated PowerShell window on a DC or a machine with RSAT. Critical system groups and AdminSDHolder-protected groups are already excluded.
+New-Item C:\GroupCleanup -ItemType Directory -Force | Out-Null
+Get-ADGroup -Filter 'GroupCategory -eq "Security"' -Properties Members, MemberOf, whenCreated, whenChanged, ManagedBy, Description, isCriticalSystemObject, adminCount, ProtectedFromAccidentalDeletion |
+  Where-Object { -not $_.isCriticalSystemObject -and $_.adminCount -ne 1 -and $_.DistinguishedName -notlike '*CN=Builtin,*' } |
+  Select-Object Name, SamAccountName, GroupScope,
+    @{n='MemberCount';e={$_.Members.Count}},
+    @{n='MemberOfCount';e={$_.MemberOf.Count}},
+    whenCreated, whenChanged, ManagedBy, Description, ProtectedFromAccidentalDeletion, DistinguishedName |
+  Export-Csv C:\GroupCleanup\all_security_groups.csv -NoTypeInformation
+Empty groups (no members), usually the safest starting point:
+Import-Csv C:\GroupCleanup\all_security_groups.csv | Where-Object { $_.MemberCount -eq 0 } | Sort-Object whenChanged | Format-Table Name, whenChanged, ManagedBy -AutoSize
+Groups not modified in 180 days or more:
+$cutoff = (Get-Date).AddDays(-180)
+Import-Csv C:\GroupCleanup\all_security_groups.csv | Where-Object { [datetime]$_.whenChanged -lt $cutoff } | Format-Table Name, MemberCount, whenChanged, ManagedBy -AutoSize
+whenChanged only shows the last change to the group object, such as a membership change. It says nothing about whether the group is still used in permissions.
+Typical candidates
+• Empty groups
+• Groups with no owner, or whose owner has left the organisation
+• Groups named after a server, application or project that has been retired
+• Duplicate groups that grant the same access as another group
+• Groups whose only members are disabled accounts
+Phase 2: Impact assessment
+For each candidate group, find every place it grants access or controls behaviour. Record the results in the change request. Set the group name once at the top of your session:
+$g   = Get-ADGroup "GroupName" -Properties Members, MemberOf, ManagedBy, Description, ProtectedFromAccidentalDeletion
+$sid = $g.SID.Value
+1. Members, including nested members
+Get-ADGroupMember $g -Recursive | Select-Object Name, ObjectClass, SamAccountName
+2. Groups this group is a member of. If it is nested in a privileged or access group, deleting it removes that access from all its members.
+$g.MemberOf | Get-ADGroup | Select-Object Name, GroupScope
+3. Delegated permissions in AD (ACLs on the domain and OUs)
+$domainDN = (Get-ADDomain).DistinguishedName
+@($domainDN) + (Get-ADOrganizationalUnit -Filter * | Select-Object -ExpandProperty DistinguishedName) | ForEach-Object {
+  $dn = $_
+  (Get-Acl "AD:\$dn").Access | Where-Object { $_.IdentityReference -like "*\$($g.SamAccountName)" } |
+    Select-Object @{n='Object';e={$dn}}, ActiveDirectoryRights, AccessControlType, ObjectType
+}
+4. Group Policy. Covers security filtering, Restricted Groups, user rights assignments and Group Policy Preferences.
+Get-GPO -All | ForEach-Object {
+  $xml = Get-GPOReport -Guid $_.Id -ReportType Xml
+  if ($xml -match [regex]::Escape($g.SamAccountName) -or $xml -match $sid) { $_.DisplayName }
+}
+5. File shares and NTFS permissions. Run on each file server, or ask its owner to.
+Get-SmbShare | ForEach-Object { Get-SmbShareAccess $_.Name } | Where-Object AccountName -like "*$($g.SamAccountName)"
+icacls D:\Shares /findsid "DOMAIN\GroupName" /t /c /q
+6. Local groups on servers. Check whether the group is in the local Administrators or Remote Desktop Users group of any server.
+Invoke-Command -ComputerName SERVER01, SERVER02 { Get-LocalGroupMember Administrators } | Where-Object Name -like "*$($g.SamAccountName)"
+7. Applications and other systems. Ask the owners to check for the group name in:
+• SQL Server logins and database roles
+• Application configuration that uses LDAP group lookups (web apps, VPN, Wi-Fi/RADIUS/NPS policies, firewalls, ADFS claim rules)
+• SharePoint, Exchange (mailbox or calendar permissions), and print server permissions
+• Scheduled tasks, scripts and monitoring tools that reference the group
+8. Entra ID, if the group is synced by Entra Connect. Look in the Entra admin center for app assignments, Conditional Access policies, group-based licensing, Teams and SharePoint Online access, and Intune assignments. Deleting the AD group deletes the cloud copy on the next sync, which can remove licences from users.
+9. Protection flag. Note whether ProtectedFromAccidentalDeletion is True. Someone may have set it deliberately; ask why before removing it.
+Outcome. If any check finds the group in use, stop. Either keep the group, or have the owner move that access to another group first and repeat the check.
+Phase 3: Approval and change request
+No group is quarantined without written owner sign-off and an approved change request.
+1. Confirm the owner. Use managedBy, the description, or the application owner. If nobody can be found, the AD team lead or IT security approves instead, and the quarantine period is the safety net.
+2. Get the owner's written confirmation that the group is no longer needed. An email or ticket comment is enough.
+3. Raise a change request with the details from the request template at the end of this document, and attach the Phase 2 results.
+4. Get CAB approval. For low-risk groups (empty, no owner, no references found), a standard pre-approved change can be used if your change policy allows it.
+5. Schedule the quarantine and tell the service desk which groups are affected, so any access complaint during the waiting period is routed to the AD team.
+Phase 4: Back up and quarantine
+Quarantine removes every member and moves the group aside, but keeps the group and its SID. Any access it granted stops, and anything that breaks can be fixed by putting the members back.
+1. Confirm the AD Recycle Bin is enabled. Do not delete any group if it is not. Without it, a restored group loses its members and memberships.
+Get-ADOptionalFeature -Filter 'Name -like "Recycle Bin Feature"' | Select-Object Name, EnabledScopes
+EnabledScopes must not be empty.
+2. Back up the group. This keeps the SID, members, memberships and all attributes in one file per group.
+$g = Get-ADGroup "GroupName" -Properties *
+$g | Export-Clixml "C:\GroupCleanup\Backup_$($g.SamAccountName)_$(Get-Date -Format yyyyMMdd).xml"
+Get-ADGroupMember $g | Select-Object SamAccountName, ObjectClass, DistinguishedName |
+  Export-Csv "C:\GroupCleanup\Members_$($g.SamAccountName).csv" -NoTypeInformation
+Store these files with the change request, not only on the DC.
+3. Create the quarantine OU once, if it does not exist. Protect it from accidental deletion and make sure no GPO that grants access is linked to it.
+New-ADOrganizationalUnit -Name "Groups-PendingDeletion" -Path (Get-ADDomain).DistinguishedName
+4. Quarantine the group
+$chg = "CHG0012345"
+$del = (Get-Date).AddDays(30).ToString('yyyy-MM-dd')
+$g = Get-ADGroup "GroupName" -Properties Members, Description
+
+# Remove all members
+if ($g.Members) { Remove-ADGroupMember $g -Members $g.Members -Confirm:$false }
+
+# Mark it, recording the original description and location
+Set-ADGroup $g -Description "PENDING DELETION $del | $chg | was: $($g.Description) | OU: $($g.DistinguishedName -replace '^CN=.+?,')"
+
+# Move it (clear accidental-deletion protection first if set)
+Set-ADObject $g -ProtectedFromAccidentalDeletion $false
+Move-ADObject $g -TargetPath "OU=Groups-PendingDeletion,$((Get-ADDomain).DistinguishedName)"
+Do not remove the group from the groups it belongs to (MemberOf). Emptying it already removes that access from users, and leaving the memberships in place makes rollback simpler.
+5. Wait 30 days. Users lose the access at their next sign-in, or when their Kerberos tickets renew, which can take up to 10 hours. During the wait:
+• The service desk routes any access complaint involving the group to the AD team.
+• If a complaint is linked to the group, roll back (see Rollback), close the request and keep the group.
+• Extend the wait to 90 days for groups linked to month-end, quarter-end or yearly processes, such as finance or audit tools.
+Phase 5: Delete and verify
+Delete the group only when the waiting period has ended with no linked complaints, and the change request is still valid.
+1. Check the group is still empty and nobody has reused it
+$g = Get-ADGroup "GroupName" -Properties Members, Description, whenChanged
+$g | Select-Object Name, @{n='MemberCount';e={$_.Members.Count}}, Description, whenChanged
+If members were added back or whenChanged is later than the quarantine date, find out why before going further.
+2. Delete it
+Set-ADObject $g -ProtectedFromAccidentalDeletion $false
+Remove-ADGroup $g -Confirm
+3. Verify
+# Should return nothing
+Get-ADGroup -Filter "SamAccountName -eq 'GroupName'"
+
+# Should show the group in Deleted Objects, which is what makes it restorable
+Get-ADObject -Filter "samAccountName -eq 'GroupName'" -IncludeDeletedObjects -Properties whenChanged, msDS-LastKnownRDN | Select-Object Name, Deleted, whenChanged
+4. After deletion
+• If the group was synced to Entra ID, confirm the cloud copy has gone after the next Entra Connect sync. It stays in Entra's deleted groups for 30 days.
+• Permissions that referenced the group now show as an unresolved SID (S-1-5-21-…) on files, shares and AD objects. They do no harm, but you can clean them up later.
+• Update the change request with the deletion date and close it. Update the CMDB or group register.
+• Keep the backup files for at least as long as the deleted object lifetime (180 days by default).
+Rollback
+How you roll back depends on how far the process has gone. A restored group keeps its original SID, so every permission that referenced it works again without changes.
+Stage reached
+How to roll back
+Effect
+Quarantined (not deleted)
+Add the members back from the CSV, move the group back to its original OU, restore the description
+Access returns at the users' next sign-in, or straight away after klist purge
+Deleted, Recycle Bin enabled, within 180 days
+Restore-ADObject, then add the members back
+Same SID, memberships and attributes come back
+Deleted, no Recycle Bin, or past 180 days
+Authoritative restore from a system-state backup, or create a new group
+A new group has a new SID, so every permission must be granted again by hand
+Roll back from quarantine
+$g = Get-ADGroup "GroupName"
+Import-Csv "C:\GroupCleanup\Members_GroupName.csv" | ForEach-Object { Add-ADGroupMember $g -Members $_.DistinguishedName }
+$orig = Import-Clixml "C:\GroupCleanup\Backup_GroupName_yyyyMMdd.xml"
+Move-ADObject $g -TargetPath ($orig.DistinguishedName -replace '^CN=.+?,')
+Set-ADGroup (Get-ADGroup "GroupName") -Description $orig.Description
+Roll back after deletion (Recycle Bin)
+Get-ADObject -Filter "samAccountName -eq 'GroupName'" -IncludeDeletedObjects | Restore-ADObject
+The group returns to the quarantine OU, where it was deleted from. It comes back empty, because its members were removed during quarantine, so then follow the quarantine rollback steps above.
+If the group was synced to Entra ID, the restored AD group syncs back on the next cycle. Within Entra's 30-day window it reattaches to the original cloud group, including app assignments and licences.
+Whoever rolls back records it in the change request, with the reason. That reason usually shows which Phase 2 check missed the dependency.
+Checklist and request template
+Copy this checklist into each change request and tick items off as you go.
+Phase 1: Identify
+[ ] Group is a security group, not built-in, not critical, adminCount is not 1
+[ ] Group is not managed by an identity governance tool
+[ ] Reason for deletion recorded (empty, retired app, duplicate, no owner)
+Phase 2: Impact assessment
+[ ] Members listed, including nested members
+[ ] MemberOf checked, and the group is not nested in a privileged group
+[ ] AD delegations (domain and OU ACLs) checked
+[ ] All GPOs searched for the group name and SID
+[ ] File shares and NTFS permissions checked on relevant file servers
+[ ] Local Administrators and Remote Desktop Users checked on relevant servers
+[ ] Application owners confirmed no use (SQL, LDAP apps, VPN/RADIUS, SharePoint, Exchange, scripts)
+[ ] Entra ID checked if synced (apps, Conditional Access, licensing, Teams, Intune)
+[ ] Reason for accidental-deletion protection understood, if it was set
+Phase 3: Approval
+[ ] Owner's written confirmation attached
+[ ] Change request approved
+[ ] Service desk told which groups are affected and the quarantine dates
+Phase 4: Back up and quarantine
+[ ] AD Recycle Bin confirmed enabled
+[ ] Group exported to XML, members exported to CSV, files attached to the change
+[ ] Members removed
+[ ] Description updated with deletion date, change number, original description and OU
+[ ] Group moved to the Groups-PendingDeletion OU
+[ ] Waiting period started (30 days, or 90 for periodic processes)
+Phase 5: Delete and verify
+[ ] No linked complaints during the wait
+[ ] Group still empty and unchanged since quarantine
+[ ] Group deleted
+[ ] Group confirmed in Deleted Objects
+[ ] Cloud copy confirmed gone from Entra ID, if synced
+[ ] Change request and CMDB updated and closed
+Request template
